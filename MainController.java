@@ -47,6 +47,15 @@ public class MainController {
     @Autowired
     private CollaborationRepository collaborationRepository;
 
+    @Autowired
+    private ExportConfigurationRepository exportConfigurationRepository;
+
+    @Autowired
+    private FamilyTreeRepository familyTreeRepository;
+
+    @Autowired
+    private ExportService exportService;
+
     // User-related methods -----------------------------------------------------
     @PostMapping(path="/add") // Map ONLY POST Requests
     public @ResponseBody String addNewUser (@RequestParam String username,
@@ -585,4 +594,78 @@ public class MainController {
             return "Error removing collaborator: " + e.getMessage();
         }
     }
+          //Export-related methods -----------------------------------------------------------------
+         // Create an export configuration
+        @PostMapping("/create")
+        public @ResponseBody String createExportConfiguration(@RequestParam Integer familyTreeId,
+                                                              @RequestParam String format,
+                                                              @RequestParam boolean includePrivateData) {
+            try {
+                FamilyTree familyTree = familyTreeRepository.findById(familyTreeId)
+                        .orElseThrow(() -> new RuntimeException("Family tree not found"));
+
+                ExportConfiguration exportConfig = new ExportConfiguration();
+                exportConfig.setFamilyTree(familyTree);
+                exportConfig.setFormat(format);
+                exportConfig.setIncludePrivateData(includePrivateData);
+
+                exportConfigurationRepository.save(exportConfig);
+                return "Export configuration created successfully.";
+            } catch (Exception e) {
+                return "Error creating export configuration: " + e.getMessage();
+            }
+        }
+
+        // Read export configurations for a specific family tree
+        @GetMapping("/getByFamilyTree")
+        public @ResponseBody List<ExportConfiguration> getExportConfigurationsByFamilyTree(@RequestParam Integer familyTreeId) {
+            return exportConfigurationRepository.findByFamilyTreeId(familyTreeId);
+        }
+
+        // Update an export configuration
+        @PostMapping("/update")
+        public @ResponseBody String updateExportConfiguration(@RequestParam Integer configId,
+                                                              @RequestParam String format,
+                                                              @RequestParam boolean includePrivateData) {
+            try {
+                ExportConfiguration exportConfig = exportConfigurationRepository.findById(configId)
+                        .orElseThrow(() -> new RuntimeException("Export configuration not found"));
+
+                exportConfig.setFormat(format);
+                exportConfig.setIncludePrivateData(includePrivateData);
+                exportConfigurationRepository.save(exportConfig);
+
+                return "Export configuration updated successfully.";
+            } catch (Exception e) {
+                return "Error updating export configuration: " + e.getMessage();
+            }
+        }
+
+        // Delete an export configuration
+        @PostMapping("/delete")
+        public @ResponseBody String deleteExportConfiguration(@RequestParam Integer configId) {
+            try {
+                exportConfigurationRepository.deleteById(configId);
+                return "Export configuration deleted successfully.";
+            } catch (Exception e) {
+                return "Error deleting export configuration: " + e.getMessage();
+            }
+        }
+
+        // Endpoint to trigger the export of the family tree
+        @GetMapping("/exportFamilyTree")
+        public @ResponseBody String exportFamilyTree(@RequestParam Integer familyTreeId,
+                                                     @RequestParam Integer configId) {
+            try {
+                FamilyTree familyTree = familyTreeRepository.findById(familyTreeId)
+                        .orElseThrow(() -> new RuntimeException("Family tree not found"));
+                ExportConfiguration config = exportConfigurationRepository.findById(configId)
+                        .orElseThrow(() -> new RuntimeException("Export configuration not found"));
+
+                // Use the ExportService to generate the export data
+                return exportService.exportFamilyTree(familyTree, config.getFormat(), config.isIncludePrivateData());
+            } catch (Exception e) {
+                return "Error exporting family tree: " + e.getMessage();
+            }
+        }
 }
