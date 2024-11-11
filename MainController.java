@@ -1,9 +1,10 @@
 package com.family_tree.familytree;
 
 import java.io.IOException;
-import java.util.Date;
-import java.util.List;
-
+import java.util.*;
+import java.text.SimpleDateFormat;
+import java.text.ParseException;
+import java.util.stream.Collectors;
 import com.family_tree.enums.Gender;
 import com.family_tree.enums.PrivacySetting;
 import com.family_tree.enums.SuggestionStatus;
@@ -14,14 +15,10 @@ import jakarta.transaction.Transactional;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.stereotype.Controller;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.ResponseBody;
+import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
-@Controller // This means that this class is a Controller
+@RestController // This means that this class is a Controller
 @RequestMapping(path="/demo") // This means URL's start with /demo (after Application path)
 public class MainController {
 
@@ -51,25 +48,30 @@ public class MainController {
     private ExportConfigurationRepository exportConfigurationRepository;
 
     @Autowired
-    private FamilyTreeRepository familyTreeRepository;
-
-    @Autowired
     private ExportService exportService;
 
+    @Autowired
+    private NotificationService notificationService;
+
     // User-related methods -----------------------------------------------------
-    @PostMapping(path="/add") // Map ONLY POST Requests
+    @PostMapping(path="/addUser") //Map only post requests
     public @ResponseBody String addNewUser (@RequestParam String username,
                                             @RequestParam String emailAddress) {
-        // @ResponseBody means the returned String is the response, not a view name
-        // @RequestParam means it is a parameter from the GET or POST request
-
-        //Ensure username and email are not left empty
+        // Ensure username and email are not left empty
         if (username == null || username.isEmpty() || emailAddress == null || emailAddress.isEmpty()) {
             return "Username and Email Address are required.";
         }
 
+        // Check for existing username or email
+        if (userRepository.existsByEmail(emailAddress)) {
+            return "Email already exists";
+        }
+        if (userRepository.existsByUsername(username)) {
+            return "Username already exists";
+        }
+
         try {
-            //Create and add user to database
+            // Create and add user to the database
             User user = new User();
             user.setUsername(username);
             user.setEmail(emailAddress);
@@ -80,10 +82,82 @@ public class MainController {
         }
     }
 
-    @GetMapping(path="/all")
+    @PostMapping("/updateUser")
+    public @ResponseBody String updateUser(@RequestParam Integer userId,
+                                           @RequestParam(required = false) String username,
+                                           @RequestParam(required = false) String email) {
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new RuntimeException("User not found"));
+
+        if (username != null && !user.getUsername().equals(username)) {
+            if (userRepository.existsByUsername(username)) {
+                return "Username already exists";
+            }
+            user.setUsername(username);
+        }
+
+        if (email != null && !user.getEmail().equals(email)) {
+            if (userRepository.existsByEmail(email)) {
+                return "Email already exists";
+            }
+            user.setEmail(email);
+        }
+
+        userRepository.save(user);
+        return "User updated successfully";
+    }
+
+    //Get user by id
+    @GetMapping("/getUserById")
+    public @ResponseBody Optional<User> getUserById(@RequestParam Integer userId) {
+        return userRepository.findById(userId);
+    }
+
+    //Search users by email or username
+    @GetMapping("/searchUsers")
+    public @ResponseBody List<User> searchUsers(@RequestParam String keyword) {
+        return userRepository.searchUsersByKeyword(keyword);
+    }
+
+    //Get user by username
+    @GetMapping("/getUserByUsername")
+    public @ResponseBody Optional<User> getUserByUsername(@RequestParam String username) {
+        return userRepository.findByUsername(username);
+    }
+
+    @GetMapping(path="/allUsers")
     public @ResponseBody Iterable<User> getAllUsers() {
         // This returns a JSON or XML with the users
         return userRepository.findAll();
+    }
+
+    @PostMapping("/deleteUser")
+    @Transactional // Ensures all deletions succeed or rollback together
+    public @ResponseBody String deleteUser(@RequestParam Integer userId) {
+        try {
+
+            // Delete family trees owned by this user
+            familyTreeRepository.deleteByOwnerId(userId);
+
+            // Remove any family members added by this user or where the user is the "owner"
+            familyMemberRepository.deleteByOwnerOrAddedBy(userId);
+
+            // Remove any suggested edits made by this user
+            suggestEditRepository.deleteBySuggestedById(userId);
+
+            // Remove any attachments uploaded by this user
+            attachmentRepository.deleteByUploadedById(userId);
+
+            // Remove any collaborations where this user is involved
+            collaborationRepository.deleteByUserId(userId);
+
+            // Finally, delete the user itself
+            userRepository.deleteById(userId);
+
+            return "User and all associated records deleted successfully";
+        } catch (Exception e) {
+            return "Error deleting user and associated records: " + e.getMessage();
+        }
     }
 
     // FamilyTree-related methods --------------------------------------------------------
@@ -143,9 +217,59 @@ public class MainController {
         }
     }
 
-    @GetMapping("/allFamilyTrees")
-    public @ResponseBody Iterable<FamilyTree> getAllFamilyTrees() {
-        return familyTreeRepository.findAll();
+
+    //Method for getting all family trees for an owner
+    @GetMapping("/getUserFamilyTrees")
+    public @ResponseBody List<FamilyTree> getUserFamilyTrees(@RequestParam Integer userId) {
+        return familyTreeRepository.findByOwner_Id(userId);
+    }
+
+    //Method for getting tree by treeId
+    @GetMapping("/getFamilyTree")
+    public @ResponseBody FamilyTree getFamilyTree(@RequestParam Integer treeId) {
+        return familyTreeRepository.findById(treeId)
+                .orElseThrow(() -> new RuntimeException("Family tree not found"));
+    }
+
+    //Method to find all public trees
+    @GetMapping("/getPublicTrees")
+    public @ResponseBody Map<String, Object> getPublicTrees() {
+        Map<String, Object> response = new HashMap<>();
+        try {
+            List<FamilyTree> publicTrees = familyTreeRepository.findByPrivacySetting(PrivacySetting.Public);
+
+            // Check if there are no public trees available
+            if (publicTrees.isEmpty()) {
+                response.put("status", "success");
+                response.put("message", "No public family trees available at this time.");
+                response.put("data", Collections.emptyList());
+                return response;
+            }
+
+            // Prepare the response data
+            List<Map<String, Object>> treeData = new ArrayList<>();
+            for (FamilyTree tree : publicTrees) {
+                Map<String, Object> treeInfo = new HashMap<>();
+                treeInfo.put("treeId", tree.getId());
+                treeInfo.put("treeName", tree.getTreeName());
+                treeInfo.put("ownerUsername", tree.getOwner().getUsername());
+                // Add more public fields if needed, while excluding sensitive information
+                treeData.add(treeInfo);
+            }
+
+            // Retrieval of public trees yields successful
+            response.put("status", "success");
+            response.put("message", "Public family trees retrieved successfully.");
+            response.put("data", treeData);
+            return response;
+
+        } catch (Exception e) {
+            // Handle any unexpected errors
+            response.put("status", "error");
+            response.put("message", "An error occurred while retrieving public family trees: " + e.getMessage());
+            response.put("data", Collections.emptyList());
+            return response;
+        }
     }
 
     //Delete family tree by ID
@@ -179,7 +303,7 @@ public class MainController {
                                                 @RequestParam Integer userId,
                                                 @RequestParam Integer treeId,
                                                 @RequestParam Integer addedById,
-                                                @RequestParam(required = false) Date deathdate,
+                                                @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") Date deathdate,
                                                 @RequestParam(required = false) String additionalInfo) {
         //Ensure required fields are not left empty (additional info can be left empty)
         if (name == null || name.isEmpty()) {
@@ -210,6 +334,7 @@ public class MainController {
 
             User addedBy = userRepository.findById(addedById)
                     .orElseThrow(() -> new RuntimeException("User not found"));
+
             //Create and add a family member to the tree
             FamilyMember familyMember = new FamilyMember();
             familyMember.setName(name);
@@ -217,6 +342,7 @@ public class MainController {
             familyMember.setDeathdate(deathdate);
             familyMember.setGender(gender);
             familyMember.setFamilyTree(familyTree);
+            familyMember.setOwner(owner);
             familyMember.setAddedBy(addedBy);
             familyMember.setAdditionalInfo(additionalInfo);
 
@@ -233,7 +359,7 @@ public class MainController {
                                                  @RequestParam(required = false) String name,
                                                  @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") Date birthdate,
                                                  @RequestParam(required = false) Gender gender,
-                                                 @RequestParam(required = false) Date deathdate,
+                                                 @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") Date deathdate,
                                                  @RequestParam(required = false) String additionalInfo) {
         try {
             // Find the existing family member
@@ -349,6 +475,83 @@ public class MainController {
         }
     }
 
+    //Method to retrieve all suggested edits on a specific tree
+    @GetMapping("/reviewSuggestedEdits")
+    public @ResponseBody List<SuggestEdit> ReviewSuggestedEdits(@RequestParam Integer treeId) {
+        return suggestEditRepository.findByTreeId(treeId);
+    }
+
+    //Method to accept suggested edits
+    @PostMapping("/acceptSuggestedEdit")
+    @Transactional
+    public @ResponseBody String acceptSuggestedEdit(@RequestParam Integer suggestionId) {
+        try {
+            // Fetch the suggested edit
+            SuggestEdit suggestedEdit = suggestEditRepository.findById(suggestionId)
+                    .orElseThrow(() -> new RuntimeException("Suggested edit not found"));
+
+            // Fetch the family member associated with the suggested edit
+            FamilyMember familyMember = suggestedEdit.getMember();
+            if (familyMember == null) {
+                return "Error: No family member associated with this suggested edit.";
+            }
+
+            // Define a date format
+            SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
+
+            // Apply the suggested edit based on the fieldName
+            switch (suggestedEdit.getFieldName()) {
+                case "name":
+                    familyMember.setName(suggestedEdit.getNewValue());
+                    break;
+                case "birthdate":
+                    familyMember.setBirthdate(dateFormat.parse(suggestedEdit.getNewValue())); // Parse string to Date
+                    break;
+                case "deathdate":
+                    familyMember.setDeathdate(dateFormat.parse(suggestedEdit.getNewValue()));
+                    break;
+                case "gender":
+                    familyMember.setGender(Gender.valueOf(suggestedEdit.getNewValue()));
+                    break;
+                case "additionalInfo":
+                    familyMember.setAdditionalInfo(suggestedEdit.getNewValue());
+                    break;
+                default:
+                    return "Error: Unsupported field for suggested edit.";
+            }
+
+            // Save the updated family member
+            familyMemberRepository.save(familyMember);
+
+            // Update the suggested edit status to Accepted
+            suggestedEdit.setSuggestionStatus(SuggestionStatus.Accepted);
+            suggestEditRepository.save(suggestedEdit);
+
+            return "Suggested edit applied and marked as Accepted.";
+        } catch (Exception e) {
+            return "Error applying suggested edit: " + e.getMessage();
+        }
+    }
+
+    //Review suggested edit of a specific family member (by family member id)
+    @GetMapping("/getSuggestedEditsForMember")
+    public @ResponseBody List<SuggestEdit> getSuggestedEditsForMember(@RequestParam Integer memberId) {
+        return suggestEditRepository.findByMember_MemberId(memberId);
+    }
+
+    //Method to decline suggested edit (suggested edit gets deleted)
+    @PostMapping("/declineSuggestedEdit")
+    @Transactional
+    public @ResponseBody String declineSuggestedEdit(@RequestParam Integer suggestionId) {
+        try {
+            // Simply delete the suggested edit
+            suggestEditRepository.deleteById(suggestionId);
+            return "Suggested edit declined successfully.";
+        } catch (Exception e) {
+            return "Error declining suggested edit: " + e.getMessage();
+        }
+    }
+
     // Method to retrieve all suggested edits
     @GetMapping("/allSuggestedEdits")
     public @ResponseBody Iterable<SuggestEdit> getAllSuggestedEdits() {
@@ -399,9 +602,63 @@ public class MainController {
         }
     }
 
-    @GetMapping("/allRelationships")
-    public @ResponseBody Iterable<Relationship> getAllRelationships() {
-        return relationshipRepository.findAll();
+    //Method for updating relationship
+    @PostMapping("/updateRelationship")
+    public @ResponseBody String updateRelationship(
+            @RequestParam Integer relationshipId,
+            @RequestParam(required = false) Integer member1Id,
+            @RequestParam(required = false) Integer member2Id,
+            @RequestParam(required = false) RelationshipType relationshipType) {
+        try {
+            Relationship relationship = relationshipRepository.findById(relationshipId)
+                    .orElseThrow(() -> new RuntimeException("Relationship not found"));
+
+            // Update member1 if provided
+            if (member1Id != null) {
+                FamilyMember member1 = familyMemberRepository.findById(member1Id)
+                        .orElseThrow(() -> new RuntimeException("Member 1 not found"));
+                relationship.setMember1(member1);
+            }
+
+            // Update member2 if provided
+            if (member2Id != null) {
+                FamilyMember member2 = familyMemberRepository.findById(member2Id)
+                        .orElseThrow(() -> new RuntimeException("Member 2 not found"));
+                relationship.setMember2(member2);
+            }
+
+            // Update relationship type if provided
+            if (relationshipType != null) {
+                relationship.setRelationship(relationshipType);
+            }
+
+            relationshipRepository.save(relationship);
+            return "Relationship Updated Successfully";
+        } catch (Exception e) {
+            return "Error updating relationship: " + e.getMessage();
+        }
+    }
+
+    //Get relationships on a tree
+    @GetMapping("/getRelationshipsForTree")
+    public @ResponseBody List<Relationship> getRelationshipsForTree(@RequestParam Integer treeId) {
+        try {
+            return relationshipRepository.findByFamilyTreeId(treeId);
+        } catch (Exception e) {
+            throw new RuntimeException("Error retrieving relationships for the tree: " + e.getMessage());
+        }
+    }
+
+    //Delete relationships by a specific family member
+    @PostMapping("/deleteRelationshipsByMember")
+    @Transactional
+    public @ResponseBody String deleteRelationshipsByMember(@RequestParam Integer memberId) {
+        try {
+            relationshipRepository.deleteByMemberId(memberId);
+            return "Relationships for member deleted successfully.";
+        } catch (Exception e) {
+            return "Error deleting relationships for member: " + e.getMessage();
+        }
     }
 
     //Attachment-related methods -----------------------------------------------------------------
@@ -447,6 +704,90 @@ public class MainController {
             return "Error saving attachment: " + e.getMessage();
         }
     }
+
+    // Method for retrieving attachments with Base64 encoding for a specific family member
+    @GetMapping("/getAttachmentsForMember")
+    public @ResponseBody List<Map<String, Object>> getAttachmentsForMember(@RequestParam Integer memberId) {
+        List<Attachment> attachments = attachmentRepository.findByMember_MemberId(memberId);
+
+        return attachments.stream().map(attachment -> {
+            Map<String, Object> response = new HashMap<>();
+            response.put("mediaId", attachment.getMediaId());
+            response.put("typeOfFile", attachment.getTypeOfFile());
+
+            // Convert binary data to Base64
+            String base64Image = Base64.getEncoder().encodeToString(attachment.getFileData());
+            response.put("fileData", "data:image/jpeg;base64," + base64Image); // Adjust MIME type as needed
+
+            return response;
+        }).collect(Collectors.toList());
+    }
+
+    //Get attachment by media id
+    @GetMapping("/getAttachment")
+    public @ResponseBody Map<String, Object> getAttachment(@RequestParam Integer mediaId) {
+        try {
+            Attachment attachment = attachmentRepository.findById(mediaId)
+                    .orElseThrow(() -> new RuntimeException("Attachment not found"));
+
+            Map<String, Object> response = new HashMap<>();
+            response.put("mediaId", attachment.getMediaId());
+            response.put("typeOfFile", attachment.getTypeOfFile());
+
+            // Convert binary data to Base64 for sending over JSON
+            String base64File = Base64.getEncoder().encodeToString(attachment.getFileData());
+            response.put("fileData", "data:application/octet-stream;base64," + base64File);
+
+            return response;
+        } catch (Exception e) {
+            throw new RuntimeException("Error retrieving attachment: " + e.getMessage());
+        }
+    }
+
+    // Update all attachments' details for a specific family member
+    @PostMapping("/updateAttachmentsForMember")
+    public @ResponseBody String updateAttachmentsForMember(
+            @RequestParam Integer memberId,
+            @RequestParam(required = false) String typeOfFile,
+            @RequestParam(required = false) MultipartFile fileData) {
+        try {
+            List<Attachment> attachments = attachmentRepository.findByMember_MemberId(memberId);
+
+            if (attachments.isEmpty()) {
+                return "No attachments found for the given family member";
+            }
+
+            for (Attachment attachment : attachments) {
+                if (typeOfFile != null && !typeOfFile.isEmpty()) {
+                    attachment.setTypeOfFile(typeOfFile);
+                }
+
+                if (fileData != null && !fileData.isEmpty()) {
+                    attachment.setFileData(fileData.getBytes());
+                }
+
+                attachmentRepository.save(attachment); // Save each updated attachment
+            }
+
+            return "Attachments Updated Successfully";
+        } catch (IOException e) {
+            return "Error reading file data: " + e.getMessage();
+        } catch (Exception e) {
+            return "Error updating attachments: " + e.getMessage();
+        }
+    }
+
+    // Delete an attachment by mediaId
+    @PostMapping("/deleteAttachment")
+    public @ResponseBody String deleteAttachment(@RequestParam Integer mediaId) {
+        try {
+            attachmentRepository.deleteById(mediaId);
+            return "Attachment Deleted Successfully";
+        } catch (Exception e) {
+            return "Error deleting attachment: " + e.getMessage();
+        }
+    }
+
 
     //Collaboration-related methods -----------------------------------------------------------------
     // Endpoint to add a collaboration directly with a specified status and role
@@ -577,6 +918,17 @@ public class MainController {
         }
     }
 
+    //Get collaboration by a collaboration id
+    @GetMapping("/getCollaboration")
+    public @ResponseBody Collaboration getCollaboration(@RequestParam Integer collaborationId) {
+        try {
+            return collaborationRepository.findById(collaborationId)
+                    .orElseThrow(() -> new RuntimeException("Collaboration not found"));
+        } catch (Exception e) {
+            throw new RuntimeException("Error retrieving collaboration: " + e.getMessage());
+        }
+    }
+
     // Endpoint to retrieve collaborations for a specific family tree
     @GetMapping("/getCollaborationsByTree")
     public @ResponseBody List<Collaboration> getCollaborationsByTree(@RequestParam Integer treeId) {
@@ -594,78 +946,160 @@ public class MainController {
             return "Error removing collaborator: " + e.getMessage();
         }
     }
-          //Export-related methods -----------------------------------------------------------------
-         // Create an export configuration
-        @PostMapping("/create")
-        public @ResponseBody String createExportConfiguration(@RequestParam Integer familyTreeId,
-                                                              @RequestParam String format,
-                                                              @RequestParam boolean includePrivateData) {
-            try {
-                FamilyTree familyTree = familyTreeRepository.findById(familyTreeId)
-                        .orElseThrow(() -> new RuntimeException("Family tree not found"));
+    //Export-related methods -----------------------------------------------------------------
+    // Create an export configuration
+    @PostMapping("/create")
+    public @ResponseBody String createExportConfiguration(@RequestParam Integer familyTreeId,
+                                                          @RequestParam String format,
+                                                          @RequestParam boolean includePrivateData) {
+        try {
+            FamilyTree familyTree = familyTreeRepository.findById(familyTreeId)
+                    .orElseThrow(() -> new RuntimeException("Family tree not found"));
 
-                ExportConfiguration exportConfig = new ExportConfiguration();
-                exportConfig.setFamilyTree(familyTree);
-                exportConfig.setFormat(format);
-                exportConfig.setIncludePrivateData(includePrivateData);
+            ExportConfiguration exportConfig = new ExportConfiguration();
+            exportConfig.setFamilyTree(familyTree);
+            exportConfig.setFormat(format);
+            exportConfig.setIncludePrivateData(includePrivateData);
 
-                exportConfigurationRepository.save(exportConfig);
-                return "Export configuration created successfully.";
-            } catch (Exception e) {
-                return "Error creating export configuration: " + e.getMessage();
-            }
+            exportConfigurationRepository.save(exportConfig);
+            return "Export configuration created successfully.";
+        } catch (Exception e) {
+            return "Error creating export configuration: " + e.getMessage();
         }
+    }
 
-        // Read export configurations for a specific family tree
-        @GetMapping("/getByFamilyTree")
-        public @ResponseBody List<ExportConfiguration> getExportConfigurationsByFamilyTree(@RequestParam Integer familyTreeId) {
-            return exportConfigurationRepository.findByFamilyTreeId(familyTreeId);
+    // Read export configurations for a specific family tree
+    @GetMapping("/getByFamilyTree")
+    public @ResponseBody List<ExportConfiguration> getExportConfigurationsByFamilyTree(@RequestParam Integer familyTreeId) {
+        return exportConfigurationRepository.findByFamilyTreeId(familyTreeId);
+    }
+
+    // Update an export configuration
+    @PostMapping("/update")
+    public @ResponseBody String updateExportConfiguration(@RequestParam Integer configId,
+                                                          @RequestParam String format,
+                                                          @RequestParam boolean includePrivateData) {
+        try {
+            ExportConfiguration exportConfig = exportConfigurationRepository.findById(configId)
+                    .orElseThrow(() -> new RuntimeException("Export configuration not found"));
+
+            exportConfig.setFormat(format);
+            exportConfig.setIncludePrivateData(includePrivateData);
+            exportConfigurationRepository.save(exportConfig);
+
+            return "Export configuration updated successfully.";
+        } catch (Exception e) {
+            return "Error updating export configuration: " + e.getMessage();
         }
+    }
 
-        // Update an export configuration
-        @PostMapping("/update")
-        public @ResponseBody String updateExportConfiguration(@RequestParam Integer configId,
-                                                              @RequestParam String format,
-                                                              @RequestParam boolean includePrivateData) {
-            try {
-                ExportConfiguration exportConfig = exportConfigurationRepository.findById(configId)
-                        .orElseThrow(() -> new RuntimeException("Export configuration not found"));
-
-                exportConfig.setFormat(format);
-                exportConfig.setIncludePrivateData(includePrivateData);
-                exportConfigurationRepository.save(exportConfig);
-
-                return "Export configuration updated successfully.";
-            } catch (Exception e) {
-                return "Error updating export configuration: " + e.getMessage();
-            }
+    // Delete an export configuration
+    @PostMapping("/delete")
+    public @ResponseBody String deleteExportConfiguration(@RequestParam Integer configId) {
+        try {
+            exportConfigurationRepository.deleteById(configId);
+            return "Export configuration deleted successfully.";
+        } catch (Exception e) {
+            return "Error deleting export configuration: " + e.getMessage();
         }
+    }
 
-        // Delete an export configuration
-        @PostMapping("/delete")
-        public @ResponseBody String deleteExportConfiguration(@RequestParam Integer configId) {
-            try {
-                exportConfigurationRepository.deleteById(configId);
-                return "Export configuration deleted successfully.";
-            } catch (Exception e) {
-                return "Error deleting export configuration: " + e.getMessage();
-            }
+    // Endpoint to trigger the export of the family tree
+    @GetMapping("/exportFamilyTree")
+    public @ResponseBody String exportFamilyTree(@RequestParam Integer familyTreeId,
+                                                 @RequestParam Integer configId) {
+        try {
+            FamilyTree familyTree = familyTreeRepository.findById(familyTreeId)
+                    .orElseThrow(() -> new RuntimeException("Family tree not found"));
+            ExportConfiguration config = exportConfigurationRepository.findById(configId)
+                    .orElseThrow(() -> new RuntimeException("Export configuration not found"));
+
+            // Use the ExportService to generate the export data
+            return exportService.exportFamilyTree(familyTree, config.getFormat(), config.isIncludePrivateData());
+        } catch (Exception e) {
+            return "Error exporting family tree: " + e.getMessage();
         }
+    }
+    //notification-related methods -----------------------------------------------------------------
+    // Endpoint to retrieve all notifications for a specific user
+    @GetMapping("/notifications/{userId}")
+    public @ResponseBody List<Notification> getUserNotifications(@PathVariable Integer userId) {
+        return notificationService.getUserNotifications(userId);
+    }
 
-        // Endpoint to trigger the export of the family tree
-        @GetMapping("/exportFamilyTree")
-        public @ResponseBody String exportFamilyTree(@RequestParam Integer familyTreeId,
-                                                     @RequestParam Integer configId) {
-            try {
-                FamilyTree familyTree = familyTreeRepository.findById(familyTreeId)
-                        .orElseThrow(() -> new RuntimeException("Family tree not found"));
-                ExportConfiguration config = exportConfigurationRepository.findById(configId)
-                        .orElseThrow(() -> new RuntimeException("Export configuration not found"));
+    // Endpoint to delete a notification by ID for a specific user
+    @DeleteMapping("/notifications/delete")
+    public @ResponseBody String deleteNotification(@RequestParam Integer userId, @RequestParam Integer notificationId) {
+        try {
+            notificationService.deleteNotification(userId, notificationId);
+            return "Notification deleted successfully.";
+        } catch (Exception e) {
+            return "Error deleting notification: " + e.getMessage();
+        }
+    }
 
-                // Use the ExportService to generate the export data
-                return exportService.exportFamilyTree(familyTree, config.getFormat(), config.isIncludePrivateData());
-            } catch (Exception e) {
-                return "Error exporting family tree: " + e.getMessage();
+    // Modifying inviteCollaborator to send a notification when a user is invited
+    @PostMapping("/collaborations/invite")
+    public @ResponseBody String inviteCollaborator(@RequestParam Integer treeId,
+                                                   @RequestParam Integer userId,
+                                                   @RequestParam Role role) {
+        try {
+            FamilyTree familyTree = familyTreeRepository.findById(treeId)
+                    .orElseThrow(() -> new RuntimeException("Family tree not found"));
+            User user = userRepository.findById(userId)
+                    .orElseThrow(() -> new RuntimeException("User not found"));
+
+            // Check if a pending or accepted collaboration already exists
+            Optional<Collaboration> existingCollaboration = collaborationRepository
+                    .findByFamilyTreeIdAndUserId(treeId, userId);
+
+            if (existingCollaboration.isPresent() &&
+                    (existingCollaboration.get().getStatus() == Status.Pending ||
+                            existingCollaboration.get().getStatus() == Status.Accepted)) {
+                return "User is already invited or a collaborator.";
             }
+
+            Collaboration collaboration = new Collaboration();
+            collaboration.setFamilyTree(familyTree);
+            collaboration.setUser(user);
+            collaboration.setRole(role);
+            collaboration.setStatus(Status.Pending);
+
+            collaborationRepository.save(collaboration);
+
+            // Send notification to the invited user
+            notificationService.createNotification(
+                    user,
+                    "You have been invited to collaborate on the tree '" + familyTree.getTreeName() + "'",
+                    "/trees/" + treeId
+            );
+
+            return "Collaboration invitation sent successfully.";
+        } catch (Exception e) {
+            return "Error inviting collaborator: " + e.getMessage();
+        }
+    }
+
+    // Modifying acceptCollaboration to send a notification when a collaboration invite is accepted
+    @PostMapping("/collaborations/accept")
+    public @ResponseBody String acceptCollaboration(@RequestParam Integer collaborationId) {
+        try {
+            Collaboration collaboration = collaborationRepository.findById(collaborationId)
+                    .orElseThrow(() -> new RuntimeException("Collaboration not found"));
+
+            collaboration.setStatus(Status.Accepted);
+            collaborationRepository.save(collaboration);
+
+            // Send notification to the tree owner about the accepted collaboration
+            notificationService.createNotification(
+                    collaboration.getFamilyTree().getOwner(),
+                    "User '" + collaboration.getUser().getUsername() + "' has accepted your collaboration invite for the tree '"
+                            + collaboration.getFamilyTree().getTreeName() + "'",
+                    "/trees/" + collaboration.getFamilyTree().getId()
+            );
+
+            return "Collaboration accepted.";
+        } catch (Exception e) {
+            return "Error accepting collaboration: " + e.getMessage();
         }
 }
